@@ -1,16 +1,3 @@
-/*
-Copyright 2023 The Alibaba Cloud Serverless Authors.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package scaler
 
 import (
@@ -21,17 +8,16 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/model"
 	"github.com/AliyunContainerService/scaler/pkg/platform_client"
 	pb "github.com/AliyunContainerService/scaler/proto"
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-type Simple struct {
+type scheduler struct {
 	config         *config.Config
 	metaData       *model.Meta
 	platformClient platform_client.Client
@@ -39,14 +25,44 @@ type Simple struct {
 	wg             sync.WaitGroup
 	instances      map[string]*model.Instance
 	idleInstance   *list.List
+
+	// Assign 频率
+	AssignStats requestStatistics
+
+	// Idle 频率
+	IdleStats requestStatistics
 }
 
-func New(metaData *model.Meta, config *config.Config) Scaler {
+type requestStatistics struct {
+	Count                uint64
+	IntervalDurationInMs []time.Duration
+	lastTime             time.Time
+
+	// CostDurationInMs map[string]int64
+}
+
+func NewRequestStatistics() requestStatistics {
+	return requestStatistics{
+		Count:                0,
+		IntervalDurationInMs: make([]time.Duration, 1024),
+		lastTime:             time.Now(),
+	}
+}
+
+func (r *requestStatistics) Inc(now time.Time) {
+	if r.Count != 0 {
+		r.IntervalDurationInMs = append(r.IntervalDurationInMs, now.Sub(r.lastTime))
+	}
+	r.Count += 1
+	r.lastTime = now
+}
+
+func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 	client, err := platform_client.New(config.ClientAddr)
 	if err != nil {
 		log.Fatalf("client init with error: %s", err.Error())
 	}
-	scheduler := &Simple{
+	scheduler := &scheduler{
 		config:         config,
 		metaData:       metaData,
 		platformClient: client,
@@ -54,6 +70,8 @@ func New(metaData *model.Meta, config *config.Config) Scaler {
 		wg:             sync.WaitGroup{},
 		instances:      make(map[string]*model.Instance),
 		idleInstance:   list.New(),
+		AssignStats:    NewRequestStatistics(),
+		IdleStats:      NewRequestStatistics(),
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
@@ -63,10 +81,10 @@ func New(metaData *model.Meta, config *config.Config) Scaler {
 		log.Printf("gc loop for app: %s is stoped", metaData.Key)
 	}()
 
-	return scheduler
+	return nil
 }
 
-func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
+func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
 	start := time.Now()
 	instanceId := uuid.New().String()
 	defer func() {
@@ -74,6 +92,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
 	s.mu.Lock()
+	s.AssignStats.Inc(start)
 	if element := s.idleInstance.Front(); element != nil {
 		instance := element.Value.(*model.Instance)
 		instance.Busy = true
@@ -138,7 +157,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}, nil
 }
 
-func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
+func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
 	if request.Assigment == nil {
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
 	}
@@ -165,6 +184,7 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 	}()
 	log.Printf("Idle, request id: %s", request.Assigment.RequestId)
 	s.mu.Lock()
+	s.IdleStats.Inc(start)
 	defer s.mu.Unlock()
 	if instance := s.instances[instanceId]; instance != nil {
 		slotId = instance.Slot.Id
@@ -189,19 +209,20 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 	}, nil
 }
 
-func (s *Simple) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string) {
+func (s *scheduler) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string) {
 	log.Printf("start delete Instance %s (Slot: %s) of app: %s", instanceId, slotId, metaKey)
 	if err := s.platformClient.DestroySLot(ctx, requestId, slotId, reason); err != nil {
 		log.Printf("delete Instance %s (Slot: %s) of app: %s failed with: %s", instanceId, slotId, metaKey, err.Error())
 	}
 }
 
-func (s *Simple) gcLoop() {
+func (s *scheduler) gcLoop() {
 	log.Printf("gc loop for app: %s is started", s.metaData.Key)
 	ticker := time.NewTicker(s.config.GcInterval)
 	for range ticker.C {
 		for {
 			s.mu.Lock()
+			fmt.Printf("AssignStats: %v, IdleStats: %v\n", s.AssignStats, s.IdleStats)
 			if element := s.idleInstance.Back(); element != nil {
 				instance := element.Value.(*model.Instance)
 				idleDuration := time.Now().Sub(instance.LastIdleTime)
@@ -227,7 +248,7 @@ func (s *Simple) gcLoop() {
 	}
 }
 
-func (s *Simple) Stats() Stats {
+func (s *scheduler) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Stats{
