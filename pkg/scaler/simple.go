@@ -170,11 +170,12 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 		slotId = instance.Slot.Id
 		instance.LastIdleTime = time.Now()
 		if needDestroy {
+			delete(s.instances, instance.Id)
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
 
-		if instance.Busy == false {
+		if !instance.Busy {
 			log.Printf("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}

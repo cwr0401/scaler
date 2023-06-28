@@ -23,35 +23,41 @@ type scheduler struct {
 	platformClient platform_client.Client
 	mu             sync.Mutex
 	wg             sync.WaitGroup
-	instances      map[string]*model.Instance
-	idleInstance   *list.List
+	// instances      map[string]*model.Instance
+
+	units    map[string]*Unit
+	idleUnit *list.List
+
+	destroyQueue chan struct{}
+	// // 冷启动成本
+	// ColdStartCost map[string]time.Duration
+	// // 释放成本
+	// ReleaseCost map[string]time.Duration
 
 	// Assign 频率
-	AssignStats requestStatistics
+	assignStats requestStatistics
 
 	// Idle 频率
-	IdleStats requestStatistics
+	idleStats requestStatistics
 }
 
 type requestStatistics struct {
-	Count                uint64
-	IntervalDurationInMs []time.Duration
-	lastTime             time.Time
-
-	// CostDurationInMs map[string]int64
+	Count            uint64
+	IntervalDuration []time.Duration
+	lastTime         time.Time
 }
 
 func NewRequestStatistics() requestStatistics {
 	return requestStatistics{
-		Count:                0,
-		IntervalDurationInMs: make([]time.Duration, 1024),
-		lastTime:             time.Now(),
+		Count:            0,
+		IntervalDuration: make([]time.Duration, 0, 1024),
+		lastTime:         time.Now(),
 	}
 }
 
 func (r *requestStatistics) Inc(now time.Time) {
 	if r.Count != 0 {
-		r.IntervalDurationInMs = append(r.IntervalDurationInMs, now.Sub(r.lastTime))
+		r.IntervalDuration = append(r.IntervalDuration, now.Sub(r.lastTime))
 	}
 	r.Count += 1
 	r.lastTime = now
@@ -68,20 +74,26 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 		platformClient: client,
 		mu:             sync.Mutex{},
 		wg:             sync.WaitGroup{},
-		instances:      make(map[string]*model.Instance),
-		idleInstance:   list.New(),
-		AssignStats:    NewRequestStatistics(),
-		IdleStats:      NewRequestStatistics(),
+		destroyQueue:   make(chan struct{}, 10),
+		units:          make(map[string]*Unit),
+		idleUnit:       list.New(),
+		assignStats:    NewRequestStatistics(),
+		idleStats:      NewRequestStatistics(),
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
-	scheduler.wg.Add(1)
+	scheduler.wg.Add(2)
 	go func() {
 		defer scheduler.wg.Done()
 		scheduler.gcLoop()
 		log.Printf("gc loop for app: %s is stoped", metaData.Key)
 	}()
+	go func() {
+		defer scheduler.wg.Done()
+		scheduler.gcLoop2()
+		log.Printf("gc loop 2 for app: %s is stoped", metaData.Key)
+	}()
 
-	return nil
+	return scheduler
 }
 
 func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
@@ -92,20 +104,21 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
 	s.mu.Lock()
-	s.AssignStats.Inc(start)
-	if element := s.idleInstance.Front(); element != nil {
-		instance := element.Value.(*model.Instance)
-		instance.Busy = true
-		s.idleInstance.Remove(element)
+	s.assignStats.Inc(start)
+	if element := s.idleUnit.Front(); element != nil {
+		unit := element.Value.(*Unit)
+		unit.NeedDestroy = false
+		unit.Instance.Busy = true
+		s.idleUnit.Remove(element)
 		s.mu.Unlock()
-		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
-		instanceId = instance.Id
+		instanceId = unit.Instance.Id
+		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
 		return &pb.AssignReply{
 			Status: pb.Status_Ok,
 			Assigment: &pb.Assignment{
 				RequestId:  request.RequestId,
-				MetaKey:    instance.Meta.Key,
-				InstanceId: instance.Id,
+				MetaKey:    unit.Instance.Meta.Key,
+				InstanceId: unit.Instance.Id,
 			},
 			ErrorMessage: nil,
 		}, nil
@@ -113,6 +126,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	s.mu.Unlock()
 
 	//Create new Instance
+	// createStart := time.Now()
 	resourceConfig := model.SlotResourceConfig{
 		ResourceConfig: pb.ResourceConfig{
 			MemoryInMegabytes: request.MetaData.MemoryInMb,
@@ -142,7 +156,12 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	//add new instance
 	s.mu.Lock()
 	instance.Busy = true
-	s.instances[instance.Id] = instance
+	unit := NewUnit(instance, s.destroyQueue, s.config.CostFluctuation)
+
+	s.units[instance.Id] = unit
+
+	go unit.gcLoop()
+
 	s.mu.Unlock()
 	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 
@@ -179,27 +198,32 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	}
 	defer func() {
 		if needDestroy {
+			// destoryStart := time.Now()
 			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance")
+			s.mu.Lock()
+			// s.ColdStartCost[instanceId] = time.Since(destoryStart)
+			delete(s.units, instanceId)
+			s.mu.Unlock()
 		}
 	}()
 	log.Printf("Idle, request id: %s", request.Assigment.RequestId)
 	s.mu.Lock()
-	s.IdleStats.Inc(start)
+	s.idleStats.Inc(start)
 	defer s.mu.Unlock()
-	if instance := s.instances[instanceId]; instance != nil {
-		slotId = instance.Slot.Id
-		instance.LastIdleTime = time.Now()
+	if unit := s.units[instanceId]; unit != nil {
+		slotId = unit.Instance.Slot.Id
+		unit.Instance.LastIdleTime = time.Now()
 		if needDestroy {
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
 
-		if instance.Busy == false {
+		if unit.Instance.Busy == false {
 			log.Printf("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
-		instance.Busy = false
-		s.idleInstance.PushFront(instance)
+		unit.Instance.Busy = false
+		s.idleUnit.PushFront(unit)
 	} else {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
@@ -222,21 +246,23 @@ func (s *scheduler) gcLoop() {
 	for range ticker.C {
 		for {
 			s.mu.Lock()
-			fmt.Printf("AssignStats: %v, IdleStats: %v\n", s.AssignStats, s.IdleStats)
-			if element := s.idleInstance.Back(); element != nil {
-				instance := element.Value.(*model.Instance)
-				idleDuration := time.Now().Sub(instance.LastIdleTime)
+			// log.Printf("Scheduler: %s, AssignStats: %v, IdleStats: %v\n", s.metaData.Key, s.AssignStats, s.IdleStats)
+			// log.Printf("Scheduler: %s, ColdStartCost: %v\n", s.metaData.Key, s.ColdStartCost)
+			if element := s.idleUnit.Back(); element != nil {
+				unit := element.Value.(*Unit)
+				idleDuration := time.Now().Sub(unit.Instance.LastIdleTime)
 				if idleDuration > s.config.IdleDurationBeforeGC {
 					//need GC
-					s.idleInstance.Remove(element)
-					delete(s.instances, instance.Id)
+					s.idleUnit.Remove(element)
+					delete(s.units, unit.Instance.Id)
 					s.mu.Unlock()
 					go func() {
 						reason := fmt.Sprintf("Idle duration: %fs, excceed configured duration: %fs", idleDuration.Seconds(), s.config.IdleDurationBeforeGC.Seconds())
+						log.Printf("GC Instance %s Delete(%s)\n", unit.Id(), reason)
 						ctx := context.Background()
 						ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 						defer cancel()
-						s.deleteSlot(ctx, uuid.NewString(), instance.Slot.Id, instance.Id, instance.Meta.Key, reason)
+						s.deleteSlot(ctx, uuid.NewString(), unit.SlotId(), unit.Id(), unit.MetaKey(), reason)
 					}()
 
 					continue
@@ -248,11 +274,45 @@ func (s *scheduler) gcLoop() {
 	}
 }
 
+func (s *scheduler) gcLoop2() {
+	log.Printf("gc loop 2 for app: %s is started", s.metaData.Key)
+	for {
+		<-s.destroyQueue
+		s.mu.Lock()
+
+		for e := s.idleUnit.Front(); e != nil; e = e.Next() {
+			unit := e.Value.(*Unit)
+			if unit.NeedDestroy {
+				log.Printf("gcloop2, Instance %s start destroy.\n", unit.Id())
+				s.idleUnit.Remove(e)
+				delete(s.units, unit.Instance.Id)
+				go func() {
+					log.Printf("GC2 Instance %s Delete(%s)\n", unit.Id(), unit.DestroyReason)
+					ctx := context.Background()
+					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel()
+					s.deleteSlot(ctx, uuid.NewString(), unit.SlotId(), unit.Id(), unit.MetaKey(), unit.DestroyReason)
+				}()
+			}
+		}
+		// if unit := s.units[instanceId]; unit != nil {
+		// 	log.Printf("gcloop2, Instance %s need be destroy.\n", instanceId)
+
+		// 	s.idleUnit.Remove(element)
+
+		// } else {
+		// 	log.Printf("gcloop2, Instance %s has been destory.\n", instanceId)
+		// }
+		s.mu.Unlock()
+
+	}
+}
+
 func (s *scheduler) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Stats{
-		TotalInstance:     len(s.instances),
-		TotalIdleInstance: s.idleInstance.Len(),
+		TotalInstance:     len(s.units),
+		TotalIdleInstance: s.idleUnit.Len(),
 	}
 }
