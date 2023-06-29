@@ -74,7 +74,7 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 		platformClient: client,
 		mu:             sync.Mutex{},
 		wg:             sync.WaitGroup{},
-		destroyQueue:   make(chan struct{}, 10),
+		destroyQueue:   make(chan struct{}, 1),
 		units:          make(map[string]*Unit),
 		idleUnit:       list.New(),
 		assignStats:    NewRequestStatistics(),
@@ -82,11 +82,11 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(2)
-	go func() {
-		defer scheduler.wg.Done()
-		scheduler.gcLoop()
-		log.Printf("gc loop for app: %s is stoped", metaData.Key)
-	}()
+	// go func() {
+	// 	defer scheduler.wg.Done()
+	// 	scheduler.gcLoop()
+	// 	log.Printf("gc loop for app: %s is stoped", metaData.Key)
+	// }()
 	go func() {
 		defer scheduler.wg.Done()
 		scheduler.gcLoop2()
@@ -107,7 +107,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	s.assignStats.Inc(start)
 	if element := s.idleUnit.Front(); element != nil {
 		unit := element.Value.(*Unit)
-		unit.NeedDestroy = false
+		unit.Status = UnitExecution
 		unit.Instance.Busy = true
 		s.idleUnit.Remove(element)
 		s.mu.Unlock()
@@ -157,7 +157,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	s.mu.Lock()
 	instance.Busy = true
 	unit := NewUnit(instance, s.destroyQueue, s.config.CostFluctuation)
-
+	unit.Status = UnitExecution
 	s.units[instance.Id] = unit
 
 	go unit.gcLoop()
@@ -200,10 +200,6 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 		if needDestroy {
 			// destoryStart := time.Now()
 			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance")
-			s.mu.Lock()
-			// s.ColdStartCost[instanceId] = time.Since(destoryStart)
-			delete(s.units, instanceId)
-			s.mu.Unlock()
 		}
 	}()
 	log.Printf("Idle, request id: %s", request.Assigment.RequestId)
@@ -212,9 +208,11 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	defer s.mu.Unlock()
 	if unit := s.units[instanceId]; unit != nil {
 		slotId = unit.Instance.Slot.Id
-		unit.Instance.LastIdleTime = time.Now()
+
 		if needDestroy {
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
+			delete(s.units, instanceId)
+			unit.Status = UnitDestroy
 			return reply, nil
 		}
 
@@ -223,6 +221,8 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 			return reply, nil
 		}
 		unit.Instance.Busy = false
+		unit.Status = UnitIdle
+		unit.Instance.LastIdleTime = time.Now()
 		s.idleUnit.PushFront(unit)
 	} else {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
@@ -282,7 +282,7 @@ func (s *scheduler) gcLoop2() {
 
 		for e := s.idleUnit.Front(); e != nil; e = e.Next() {
 			unit := e.Value.(*Unit)
-			if unit.NeedDestroy {
+			if unit.Status == UnitNeedDestroy {
 				log.Printf("gcloop2, Instance %s start destroy.\n", unit.Id())
 				s.idleUnit.Remove(e)
 				delete(s.units, unit.Instance.Id)
@@ -293,18 +293,10 @@ func (s *scheduler) gcLoop2() {
 					defer cancel()
 					s.deleteSlot(ctx, uuid.NewString(), unit.SlotId(), unit.Id(), unit.MetaKey(), unit.DestroyReason)
 				}()
+				unit.Status = UnitDestroy
 			}
 		}
-		// if unit := s.units[instanceId]; unit != nil {
-		// 	log.Printf("gcloop2, Instance %s need be destroy.\n", instanceId)
-
-		// 	s.idleUnit.Remove(element)
-
-		// } else {
-		// 	log.Printf("gcloop2, Instance %s has been destory.\n", instanceId)
-		// }
 		s.mu.Unlock()
-
 	}
 }
 
