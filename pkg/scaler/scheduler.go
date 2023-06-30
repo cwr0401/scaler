@@ -11,6 +11,7 @@ import (
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/model"
 	"github.com/AliyunContainerService/scaler/pkg/platform_client"
+	"github.com/AliyunContainerService/scaler/pkg/telemetry"
 	pb "github.com/AliyunContainerService/scaler/proto"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
@@ -90,6 +91,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		log.Printf("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
+
 	s.mu.Lock()
 	s.assignStats.Inc(start)
 	if element := s.idleUnit.Front(); element != nil {
@@ -99,6 +101,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		s.mu.Unlock()
 		instanceId = unit.Instance.Id
 		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
+		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "Reuse").Inc()
 		return &pb.AssignReply{
 			Status: pb.Status_Ok,
 			Assigment: &pb.Assignment{
@@ -120,6 +123,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	}
 	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
 	if err != nil {
+		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "CreateSlotFailed").Inc()
 		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
 		log.Printf(errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
@@ -134,6 +138,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	}
 	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
 	if err != nil {
+		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "InitFailed").Inc()
 		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
 		log.Printf(errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
@@ -147,7 +152,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 
 	s.mu.Unlock()
 	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
-
+	telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "Create").Inc()
 	return &pb.AssignReply{
 		Status: pb.Status_Ok,
 		Assigment: &pb.Assignment{
@@ -161,6 +166,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 
 func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
 	if request.Assigment == nil {
+		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "InvalidArgument").Inc()
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
 	}
 	reply := &pb.IdleReply{
@@ -191,6 +197,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	if unit := s.units[instanceId]; unit != nil {
 		slotId = unit.Instance.Slot.Id
 		if needDestroy {
+			telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "Destory").Inc()
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			delete(s.units, instanceId)
 			unit.Status = UnitDestroy
@@ -198,14 +205,17 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 		}
 
 		if unit.Instance.Busy == false {
+			telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "AlreadyFreed").Inc()
 			log.Printf("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
 		unit.SetIdle()
 		s.idleUnit.PushFront(unit)
 	} else {
+		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "NotFound").Inc()
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
+	telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "OK").Inc()
 	return &pb.IdleReply{
 		Status:       pb.Status_Ok,
 		ErrorMessage: nil,

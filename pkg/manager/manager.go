@@ -17,10 +17,12 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/model"
 	"github.com/AliyunContainerService/scaler/pkg/scaler"
+	"github.com/AliyunContainerService/scaler/pkg/telemetry"
 )
 
 type Manager struct {
@@ -38,6 +40,7 @@ func New(config *config.Config) *Manager {
 }
 
 func (m *Manager) GetOrCreate(metaData *model.Meta) scaler.Scaler {
+	start := time.Now()
 	m.rw.RLock()
 	if scheduler := m.schedulers[metaData.Key]; scheduler != nil {
 		m.rw.RUnlock()
@@ -55,6 +58,8 @@ func (m *Manager) GetOrCreate(metaData *model.Meta) scaler.Scaler {
 	scheduler := scaler.NewScheduler(metaData, m.config)
 	m.schedulers[metaData.Key] = scheduler
 	m.rw.Unlock()
+	// log.Printf("Create Scheduler %s", time.Since(start))
+	telemetry.Metrics.CreateSchedulerDurations.Observe(float64(time.Since(start).Microseconds()))
 	return scheduler
 }
 

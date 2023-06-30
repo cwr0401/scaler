@@ -23,6 +23,7 @@ import (
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/manager"
 	"github.com/AliyunContainerService/scaler/pkg/model"
+	"github.com/AliyunContainerService/scaler/pkg/telemetry"
 	pb "github.com/AliyunContainerService/scaler/proto"
 )
 
@@ -38,7 +39,9 @@ func New() *Server {
 }
 
 func (s *Server) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
+	// 调用次数
 	if request.MetaData == nil {
+		telemetry.Metrics.ServerRequest.WithLabelValues("Assign", "InvalidArgument").Inc()
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("app meta is nil"))
 	}
 	metaData := &model.Meta{
@@ -48,22 +51,27 @@ func (s *Server) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 			TimeoutInSecs: request.MetaData.TimeoutInSecs,
 		},
 	}
+
 	scheduler := s.mgr.GetOrCreate(metaData)
+	telemetry.Metrics.ServerRequest.WithLabelValues("Assign", "OK").Inc()
 	return scheduler.Assign(ctx, request)
 }
 
 func (s *Server) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
 	if request.Assigment == nil {
+		telemetry.Metrics.ServerRequest.WithLabelValues("Idle", "InvalidArgument").Inc()
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
 	}
 	key := request.Assigment.MetaKey
 	scheduler, err := s.mgr.Get(key)
 	if err != nil {
+		telemetry.Metrics.ServerRequest.WithLabelValues("Idle", "InternalError").Inc()
 		errorMessage := fmt.Sprintf("scaler for app: %s not found", key)
 		return &pb.IdleReply{
 			Status:       pb.Status_InternalError,
 			ErrorMessage: &errorMessage,
 		}, nil
 	}
+	telemetry.Metrics.ServerRequest.WithLabelValues("Idle", "OK").Inc()
 	return scheduler.Idle(ctx, request)
 }

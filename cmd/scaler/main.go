@@ -17,10 +17,15 @@ import (
 	"log"
 	"net"
 
+	"net/http"
+	_ "net/http/pprof"
+
 	"google.golang.org/grpc"
 
 	"github.com/AliyunContainerService/scaler/pkg/server"
+	"github.com/AliyunContainerService/scaler/pkg/telemetry"
 	pb "github.com/AliyunContainerService/scaler/proto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -31,6 +36,27 @@ func main() {
 	s := grpc.NewServer(grpc.MaxConcurrentStreams(1000))
 	pb.RegisterScalerServer(s, server.New())
 	log.Printf("server listening at %v", lis.Addr())
+
+	// Expose /metrics HTTP endpoint using the created custom registry.
+	http.Handle(
+		"/metrics", promhttp.HandlerFor(
+			telemetry.PromReg,
+			promhttp.HandlerOpts{
+				EnableOpenMetrics: true,
+			}),
+	)
+
+	// metrics
+	go func() {
+		log.Printf("http server listening at %v", "0.0.0.0:9002")
+		err := http.ListenAndServe("0.0.0.0:9002", nil)
+		if err != nil {
+			log.Fatalf("failed to http listen: %v", err)
+		}
+	}()
+
+	// Add go runtime metrics and process collectors.
+
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
