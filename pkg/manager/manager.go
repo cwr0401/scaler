@@ -15,9 +15,10 @@ package manager
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/model"
@@ -53,12 +54,12 @@ func (m *Manager) GetOrCreate(metaData *model.Meta) scaler.Scaler {
 		m.rw.Unlock()
 		return scheduler
 	}
-	log.Printf("Create new scaler for app %s", metaData.Key)
+	log.Infof("Create new scaler for app %s", metaData.Key)
 	// scheduler := scaler.New(metaData, m.config)
 	scheduler := scaler.NewScheduler(metaData, m.config)
 	m.schedulers[metaData.Key] = scheduler
 	m.rw.Unlock()
-	// log.Printf("Create Scheduler %s", time.Since(start))
+	// log.Infof("Create Scheduler %s", time.Since(start))
 	telemetry.Metrics.CreateSchedulerDurations.Observe(float64(time.Since(start).Microseconds()))
 	return scheduler
 }

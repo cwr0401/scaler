@@ -17,8 +17,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

@@ -4,9 +4,10 @@ import (
 	"container/list"
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/model"
@@ -72,13 +73,13 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 		assignStats:    NewRequestStatistics(),
 		idleStats:      NewRequestStatistics(),
 	}
-	log.Printf("New scaler for app: %s is created", metaData.Key)
+	log.Infof("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
 
 	go func() {
 		defer scheduler.wg.Done()
 		scheduler.gcLoop()
-		log.Printf("gc loop 2 for app: %s is stoped", metaData.Key)
+		log.Infof("gc loop 2 for app: %s is stoped", metaData.Key)
 	}()
 
 	return scheduler
@@ -88,9 +89,9 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	start := time.Now()
 	instanceId := uuid.New().String()
 	defer func() {
-		log.Printf("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
+		log.Infof("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
 	}()
-	log.Printf("Assign, request id: %s", request.RequestId)
+	log.Infof("Assign, request id: %s", request.RequestId)
 
 	s.mu.Lock()
 	s.assignStats.Inc(start)
@@ -100,7 +101,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		s.idleUnit.Remove(element)
 		s.mu.Unlock()
 		instanceId = unit.Instance.Id
-		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
+		log.Infof("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
 		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "Reuse").Inc()
 		return &pb.AssignReply{
 			Status: pb.Status_Ok,
@@ -125,7 +126,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	if err != nil {
 		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "CreateSlotFailed").Inc()
 		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
-		log.Printf(errorMessage)
+		log.Infof(errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
 
@@ -140,7 +141,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	if err != nil {
 		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "InitFailed").Inc()
 		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
-		log.Printf(errorMessage)
+		log.Infof(errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
 
@@ -151,7 +152,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	s.units[instance.Id] = unit
 
 	s.mu.Unlock()
-	log.Printf("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
+	log.Infof("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
 	telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "Create").Inc()
 	return &pb.AssignReply{
 		Status: pb.Status_Ok,
@@ -176,9 +177,9 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	start := time.Now()
 	instanceId := request.Assigment.InstanceId
 	defer func() {
-		log.Printf("Idle, request id: %s, instance: %s, cost %dus", request.Assigment.RequestId, instanceId, time.Since(start).Microseconds())
+		log.Infof("Idle, request id: %s, instance: %s, cost %dus", request.Assigment.RequestId, instanceId, time.Since(start).Microseconds())
 	}()
-	//log.Printf("Idle, request id: %s", request.Assigment.RequestId)
+	//log.Infof("Idle, request id: %s", request.Assigment.RequestId)
 	needDestroy := false
 
 	slotId := ""
@@ -190,7 +191,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance")
 		}
 	}()
-	log.Printf("Idle, request id: %s", request.Assigment.RequestId)
+	log.Infof("Idle, request id: %s", request.Assigment.RequestId)
 	s.mu.Lock()
 	s.idleStats.Inc(start)
 	defer s.mu.Unlock()
@@ -198,7 +199,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 		slotId = unit.Instance.Slot.Id
 		if needDestroy {
 			telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "Destory").Inc()
-			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
+			log.Infof("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			delete(s.units, instanceId)
 			unit.Status = UnitDestroy
 			return reply, nil
@@ -206,7 +207,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 
 		if unit.Instance.Busy == false {
 			telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "AlreadyFreed").Inc()
-			log.Printf("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
+			log.Infof("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
 		unit.SetIdle()
@@ -223,27 +224,27 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 }
 
 func (s *scheduler) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string) {
-	log.Printf("start delete Instance %s (Slot: %s) of app: %s", instanceId, slotId, metaKey)
+	log.Infof("start delete Instance %s (Slot: %s) of app: %s", instanceId, slotId, metaKey)
 	if err := s.platformClient.DestroySLot(ctx, requestId, slotId, reason); err != nil {
-		log.Printf("delete Instance %s (Slot: %s) of app: %s failed with: %s", instanceId, slotId, metaKey, err.Error())
+		log.Infof("delete Instance %s (Slot: %s) of app: %s failed with: %s", instanceId, slotId, metaKey, err.Error())
 	}
 }
 
 func (s *scheduler) gcLoop() {
-	log.Printf("gc loop for app: %s is started", s.metaData.Key)
+	log.Infof("gc loop for app: %s is started", s.metaData.Key)
 	ticker := time.NewTicker(1 * time.Millisecond)
 	for range ticker.C {
 		s.mu.Lock()
-		// log.Printf("gc loop for app: %s is started, TotalInstance %d TotalIdleInstance %d", s.metaData.Key, len(s.units), s.idleUnit.Len())
+		// log.Infof("gc loop for app: %s is started, TotalInstance %d TotalIdleInstance %d", s.metaData.Key, len(s.units), s.idleUnit.Len())
 		for e := s.idleUnit.Front(); e != nil; e = e.Next() {
 			unit := e.Value.(*Unit)
 			unit.SetNeedDestroy()
 			if unit.Status == UnitNeedDestroy {
-				// log.Printf("gc loop for app: %s, Instance %s start destroy.\n", s.metaData.Key, unit.Id())
+				// log.Infof("gc loop for app: %s, Instance %s start destroy.", s.metaData.Key, unit.Id())
 				s.idleUnit.Remove(e)
 				delete(s.units, unit.Instance.Id)
 				go func() {
-					log.Printf("Instance %s Delete(%s)\n", unit.Id(), unit.DestroyReason)
+					log.Infof("Instance %s Delete(%s)", unit.Id(), unit.DestroyReason)
 					ctx := context.Background()
 					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 					defer cancel()

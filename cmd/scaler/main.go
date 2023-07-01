@@ -14,8 +14,8 @@ limitations under the License.
 package main
 
 import (
-	"log"
 	"net"
+	"time"
 
 	"net/http"
 	_ "net/http/pprof"
@@ -26,9 +26,14 @@ import (
 	"github.com/AliyunContainerService/scaler/pkg/telemetry"
 	pb "github.com/AliyunContainerService/scaler/proto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	log "github.com/sirupsen/logrus"
 )
 
 func main() {
+	log.SetFormatter(&log.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+	})
 	lis, err := net.Listen("tcp", ":9001")
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)

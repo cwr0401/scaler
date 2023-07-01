@@ -91,7 +91,7 @@ func (i *Unit) ColdStartCost() uint64 {
 }
 
 // func (i *Unit) gcLoop() {
-// 	log.Printf("gc loop for Meta %s Unit %s is started", i.MetaKey(), i.Id())
+// 	log.Infof("gc loop for Meta %s Unit %s is started", i.MetaKey(), i.Id())
 // 	// 豪秒级别
 // 	ticker := time.NewTicker(1 * time.Millisecond)
 // 	maxIdleTime := int64((1.0 + i.CostFluctuation) * float64(i.ColdStartCost()))
@@ -105,15 +105,15 @@ func (i *Unit) ColdStartCost() uint64 {
 // 		case UnitNeedDestroy:
 // 			continue
 // 		case UnitDestroy:
-// 			log.Printf(" %s Unit %s is stopped", i.MetaKey(), i.Id())
+// 			log.Infof(" %s Unit %s is stopped", i.MetaKey(), i.Id())
 // 			return
 // 		case UnitIdle:
 // 			i.setNeedDestroy(maxIdleTime)
 // 			if i.Status == UnitNeedDestroy {
-// 				log.Printf("App %s Unit %s need destroy because %s.\n", i.MetaKey(), i.Id(), i.DestroyReason)
+// 				log.Infof("App %s Unit %s need destroy because %s.", i.MetaKey(), i.Id(), i.DestroyReason)
 // 				select {
 // 				case i.GCQueue <- struct{}{}:
-// 					log.Printf("App %s Unit %s send a gc signal.", i.MetaKey(), i.Id())
+// 					log.Infof("App %s Unit %s send a gc signal.", i.MetaKey(), i.Id())
 // 				default:
 // 				}
 
