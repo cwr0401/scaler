@@ -74,6 +74,7 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 		idleStats:      NewRequestStatistics(),
 	}
 	log.WithField("app", metaData.Key).Info("New scaler is created")
+	telemetry.Metrics.SchedulerUnitSlotResources.WithLabelValues(metaData.Key).Set(float64(metaData.GetMemoryInMb()))
 	// log.Infof("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
 
@@ -198,7 +199,7 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		"instance_id": instance.Id,
 		"app":         instance.Meta.Key,
 	}).Infof("Scheduler Assign create instance init latency: %dms", instance.InitDurationInMs)
-	telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "InitFailed").Observe(
+	telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "CreateSuccess").Observe(
 		float64(time.Since(start).Milliseconds()),
 	)
 	return &pb.AssignReply{
@@ -229,6 +230,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 
 	instanceId := request.Assigment.InstanceId
 	needDestroy := false
+	var instanceCreateTime int64 = 0
 
 	action := ""
 
@@ -250,7 +252,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	}
 	defer func() {
 		if needDestroy {
-			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance")
+			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance", instanceCreateTime)
 		}
 	}()
 	log.WithFields(log.Fields{
@@ -262,6 +264,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	defer s.mu.Unlock()
 	if unit := s.units[instanceId]; unit != nil {
 		slotId = unit.Instance.Slot.Id
+		instanceCreateTime = int64(unit.Instance.Slot.CreateTime)
 		if needDestroy {
 			action = "Destroy"
 			log.WithFields(log.Fields{
@@ -297,10 +300,31 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	}, nil
 }
 
-func (s *scheduler) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string) {
-	log.Infof("start delete Instance %s (Slot: %s) of app: %s", instanceId, slotId, metaKey)
+func (s *scheduler) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string, createTimeInMs int64) {
+	var aliveTime int64
+	if createTimeInMs != 0 {
+		now := time.Now().UnixMilli()
+		aliveTime = now - createTimeInMs
+	}
+
+	// log.Infof("start delete Instance %s (Slot: %s) of app: %s", instanceId, slotId, metaKey)
+	log.WithFields(log.Fields{
+		"app":         s.metaData.Key,
+		"request_id":  requestId,
+		"instance_id": instanceId,
+	}).Infof("Start delete Instance(Slot: %s), Alive time %dms", slotId, aliveTime)
+
+	telemetry.Metrics.SchedulerUnitDurations.WithLabelValues(s.metaData.Key, "all").Observe(
+		float64(aliveTime),
+	)
+
 	if err := s.platformClient.DestroySLot(ctx, requestId, slotId, reason); err != nil {
-		log.Infof("delete Instance %s (Slot: %s) of app: %s failed with: %s", instanceId, slotId, metaKey, err.Error())
+		// log.Infof("delete Instance %s (Slot: %s) of app: %s failed with: %s", instanceId, slotId, metaKey, err.Error())
+		log.WithFields(log.Fields{
+			"app":         s.metaData.Key,
+			"request_id":  requestId,
+			"instance_id": instanceId,
+		}).Infof("Delete Instance(Slot: %s) failed with: %s", slotId, err.Error())
 	}
 }
 
@@ -322,7 +346,7 @@ func (s *scheduler) gcLoop() {
 					ctx := context.Background()
 					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 					defer cancel()
-					s.deleteSlot(ctx, uuid.NewString(), unit.SlotId(), unit.Id(), unit.MetaKey(), unit.DestroyReason)
+					s.deleteSlot(ctx, uuid.NewString(), unit.SlotId(), unit.Id(), unit.MetaKey(), unit.DestroyReason, int64(unit.Instance.Slot.CreateTime))
 				}()
 				unit.Status = UnitDestroy
 			}

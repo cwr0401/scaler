@@ -14,6 +14,8 @@ type metrics struct {
 	SchedulerAssignReuse           *prometheus.CounterVec
 	SchedulerAssignCreateDurations *prometheus.HistogramVec
 	SchedulerIdle                  *prometheus.CounterVec
+	SchedulerUnitSlotResources     *prometheus.GaugeVec
+	SchedulerUnitDurations         *prometheus.HistogramVec
 }
 
 func NewMetrics(reg prometheus.Registerer) *metrics {
@@ -45,6 +47,15 @@ func NewMetrics(reg prometheus.Registerer) *metrics {
 			Name: "scheduler_idle_total",
 			Help: "Scheduler idle request.",
 		}, []string{"app", "status"}),
+		SchedulerUnitSlotResources: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "scheduler_unit_resouces_memory_in_mb",
+			Help: "How many Scheduler Unit be used memory(MB)",
+		}, []string{"app"}),
+		SchedulerUnitDurations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "scheduler_unit_duration_milliseconds",
+			Help:    "Scheduler unit durtaion.",
+			Buckets: []float64{100, 1000, 3600, 10000, 60000, 300000},
+		}, []string{"app", "status"}),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -56,6 +67,9 @@ func NewMetrics(reg prometheus.Registerer) *metrics {
 		m.SchedulerAssignReuse,
 		m.SchedulerAssignCreateDurations,
 		m.SchedulerIdle,
+		m.SchedulerUnitSlotResources,
+		m.SchedulerUnitDurations,
 	)
+
 	return m
 }
