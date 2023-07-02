@@ -9,9 +9,11 @@ var PromReg = prometheus.NewRegistry()
 var Metrics = NewMetrics(PromReg)
 
 type metrics struct {
-	CreateSchedulerDurations prometheus.Histogram
-	ServerRequest            *prometheus.CounterVec
-	SchedulerRequest         *prometheus.CounterVec
+	CreateSchedulerDurations       prometheus.Histogram
+	ServerRequest                  *prometheus.CounterVec
+	SchedulerAssignReuse           *prometheus.CounterVec
+	SchedulerAssignCreateDurations *prometheus.HistogramVec
+	SchedulerIdle                  *prometheus.CounterVec
 }
 
 func NewMetrics(reg prometheus.Registerer) *metrics {
@@ -23,12 +25,26 @@ func NewMetrics(reg prometheus.Registerer) *metrics {
 		}),
 		ServerRequest: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "server_request_total",
-			Help: "How many Assign/Idle requests processed, partitioned by status.",
-		}, []string{"method", "status"}),
-		SchedulerRequest: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "scheduler_request_total",
-			Help: "How many Scheduler Assign/Idle requests processed, partitioned by app(meta key), status and method.",
-		}, []string{"app", "method", "status"}),
+			Help: "How many Assign/Idle requests processed, partitioned by action.",
+		}, []string{"method", "action"}),
+		SchedulerAssignReuse: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "scheduler_assign_reuse_total",
+			Help: "Scheduler reuse an instance for assign request.",
+		}, []string{"app"}),
+		// SchedulerRequestDurations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		// 	Name:    "scheduler_request_duration_milliseconds",
+		// 	Help:    "How many Scheduler Assign/Idle requests lantency(ms), partitioned by app(meta key), action and method.",
+		// 	Buckets: []float64{},
+		// }, []string{"app", "method", "action"}),
+		SchedulerAssignCreateDurations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "scheduler_assign_create_duration_milliseconds",
+			Help:    "How many Scheduler Assign request create instance lantency(ms), partitioned by app(meta key), status",
+			Buckets: []float64{500, 1000, 3000, 5000, 10000},
+		}, []string{"app", "status"}),
+		SchedulerIdle: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "scheduler_idle_total",
+			Help: "Scheduler idle request.",
+		}, []string{"app", "status"}),
 	}
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -37,7 +53,9 @@ func NewMetrics(reg prometheus.Registerer) *metrics {
 	reg.MustRegister(
 		m.CreateSchedulerDurations,
 		m.ServerRequest,
-		m.SchedulerRequest,
+		m.SchedulerAssignReuse,
+		m.SchedulerAssignCreateDurations,
+		m.SchedulerIdle,
 	)
 	return m
 }

@@ -60,7 +60,7 @@ func (r *requestStatistics) Inc(now time.Time) {
 func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 	client, err := platform_client.New(config.ClientAddr)
 	if err != nil {
-		log.Fatalf("client init with error: %s", err.Error())
+		log.WithField("app", metaData.Key).Fatalf("client init with error: %s", err.Error())
 	}
 	scheduler := &scheduler{
 		config:         config,
@@ -73,13 +73,15 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 		assignStats:    NewRequestStatistics(),
 		idleStats:      NewRequestStatistics(),
 	}
-	log.Infof("New scaler for app: %s is created", metaData.Key)
+	log.WithField("app", metaData.Key).Info("New scaler is created")
+	// log.Infof("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
 
 	go func() {
 		defer scheduler.wg.Done()
 		scheduler.gcLoop()
-		log.Infof("gc loop 2 for app: %s is stoped", metaData.Key)
+		log.WithField("app", metaData.Key).Warnf("Scheduler GC goroutinue is stopped")
+		// log.Infof("gc loop 2 for app: %s is stoped", metaData.Key)
 	}()
 
 	return scheduler
@@ -88,10 +90,18 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
 	start := time.Now()
 	instanceId := uuid.New().String()
+
 	defer func() {
-		log.Infof("Assign, request id: %s, instance id: %s, cost %dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
+		log.WithFields(log.Fields{
+			"app":         s.metaData.Key,
+			"request_id":  request.RequestId,
+			"instance_id": instanceId,
+		}).Infof("Assign cost %dms", time.Since(start).Milliseconds())
 	}()
-	log.Infof("Assign, request id: %s", request.RequestId)
+	log.WithFields(log.Fields{
+		"app":        s.metaData.Key,
+		"request_id": request.RequestId,
+	}).Infof("Scheduler Assign started")
 
 	s.mu.Lock()
 	s.assignStats.Inc(start)
@@ -101,8 +111,15 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		s.idleUnit.Remove(element)
 		s.mu.Unlock()
 		instanceId = unit.Instance.Id
-		log.Infof("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
-		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "Reuse").Inc()
+		// log.Infof("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
+		log.WithFields(log.Fields{
+			"app":         s.metaData.Key,
+			"request_id":  request.RequestId,
+			"instance_id": instanceId,
+		}).Infof("Scheduler Assign reuse instance")
+		telemetry.Metrics.SchedulerAssignReuse.WithLabelValues(
+			s.metaData.Key,
+		).Inc()
 		return &pb.AssignReply{
 			Status: pb.Status_Ok,
 			Assigment: &pb.Assignment{
@@ -116,17 +133,28 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	s.mu.Unlock()
 
 	//Create new Instance
-	// createStart := time.Now()
 	resourceConfig := model.SlotResourceConfig{
 		ResourceConfig: pb.ResourceConfig{
 			MemoryInMegabytes: request.MetaData.MemoryInMb,
 		},
 	}
+	log.WithFields(log.Fields{
+		"app":         s.metaData.Key,
+		"request_id":  request.RequestId,
+		"instance_id": instanceId,
+	}).Infof("Scheduler Assign invokes CreateSlot")
 	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
 	if err != nil {
-		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "CreateSlotFailed").Inc()
+		telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "CreateSlotFailed").Observe(
+			float64(time.Since(start).Milliseconds()),
+		)
 		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
-		log.Infof(errorMessage)
+		// log.Infof(errorMessage)
+		log.WithFields(log.Fields{
+			"app":         s.metaData.Key,
+			"request_id":  request.RequestId,
+			"instance_id": instanceId,
+		}).Errorf("Scheduler Assign %s", errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
 
@@ -137,11 +165,23 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 			TimeoutInSecs: request.MetaData.TimeoutInSecs,
 		},
 	}
+	log.WithFields(log.Fields{
+		"app":         s.metaData.Key,
+		"request_id":  request.RequestId,
+		"instance_id": instanceId,
+	}).Infof("Scheduler Assign invokes Init")
 	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
 	if err != nil {
-		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "InitFailed").Inc()
+		telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "InitFailed").Observe(
+			float64(time.Since(start).Milliseconds()),
+		)
 		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
-		log.Infof(errorMessage)
+		// log.Infof(errorMessage)
+		log.WithFields(log.Fields{
+			"app":         s.metaData.Key,
+			"request_id":  request.RequestId,
+			"instance_id": instanceId,
+		}).Errorf("Scheduler Assign %s", errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
 
@@ -152,8 +192,15 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 	s.units[instance.Id] = unit
 
 	s.mu.Unlock()
-	log.Infof("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
-	telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Assign", "Create").Inc()
+	// log.Infof("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
+	log.WithFields(log.Fields{
+		"request_id":  request.RequestId,
+		"instance_id": instance.Id,
+		"app":         instance.Meta.Key,
+	}).Infof("Scheduler Assign create instance init latency: %dms", instance.InitDurationInMs)
+	telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "InitFailed").Observe(
+		float64(time.Since(start).Milliseconds()),
+	)
 	return &pb.AssignReply{
 		Status: pb.Status_Ok,
 		Assigment: &pb.Assignment{
@@ -166,21 +213,36 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 }
 
 func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
+	start := time.Now()
 	if request.Assigment == nil {
-		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "InvalidArgument").Inc()
-		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
+		telemetry.Metrics.SchedulerIdle.WithLabelValues(s.metaData.Key, "InvalidArgument").Inc()
+		errorMessage := fmt.Sprintf("assignment is nil")
+		log.WithFields(log.Fields{
+			"app": s.metaData.Key,
+		}).Errorf("Scheduler Idle %s", errorMessage)
+		return nil, status.Errorf(codes.InvalidArgument, errorMessage)
 	}
 	reply := &pb.IdleReply{
 		Status:       pb.Status_Ok,
 		ErrorMessage: nil,
 	}
-	start := time.Now()
+
 	instanceId := request.Assigment.InstanceId
+	needDestroy := false
+
+	action := ""
+
 	defer func() {
-		log.Infof("Idle, request id: %s, instance: %s, cost %dus", request.Assigment.RequestId, instanceId, time.Since(start).Microseconds())
+		durationInMs := time.Since(start).Milliseconds()
+		log.WithFields(log.Fields{
+			"app":         s.metaData.Key,
+			"request_id":  request.Assigment.RequestId,
+			"instance_id": instanceId,
+			"action":      action,
+		}).Infof("Scheduler Idle, cost %dus", durationInMs)
+		telemetry.Metrics.SchedulerIdle.WithLabelValues(s.metaData.Key, action).Inc()
 	}()
 	//log.Infof("Idle, request id: %s", request.Assigment.RequestId)
-	needDestroy := false
 
 	slotId := ""
 	if request.Result != nil && request.Result.NeedDestroy != nil && *request.Result.NeedDestroy {
@@ -191,32 +253,44 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance")
 		}
 	}()
-	log.Infof("Idle, request id: %s", request.Assigment.RequestId)
+	log.WithFields(log.Fields{
+		"app":        s.metaData.Key,
+		"request_id": request.Assigment.RequestId,
+	}).Infof("Scheduler Idle started")
 	s.mu.Lock()
 	s.idleStats.Inc(start)
 	defer s.mu.Unlock()
 	if unit := s.units[instanceId]; unit != nil {
 		slotId = unit.Instance.Slot.Id
 		if needDestroy {
-			telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "Destory").Inc()
-			log.Infof("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
+			action = "Destroy"
+			log.WithFields(log.Fields{
+				"app":         s.metaData.Key,
+				"request_id":  request.Assigment.RequestId,
+				"instance_id": instanceId,
+			}).Infof("Scheduler Idle instance need be destroy")
 			delete(s.units, instanceId)
 			unit.Status = UnitDestroy
 			return reply, nil
 		}
 
-		if unit.Instance.Busy == false {
-			telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "AlreadyFreed").Inc()
-			log.Infof("request id %s, instance %s already freed", request.Assigment.RequestId, instanceId)
+		if !unit.Instance.Busy {
+			log.WithFields(log.Fields{
+				"app":         s.metaData.Key,
+				"request_id":  request.Assigment.RequestId,
+				"instance_id": instanceId,
+			}).Warnf("Scheduler Idle instance already freed")
+			action = "AlreadyFreed"
 			return reply, nil
 		}
+		action = "Release"
 		unit.SetIdle()
 		s.idleUnit.PushFront(unit)
 	} else {
-		telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "NotFound").Inc()
+		action = "NotFound"
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
-	telemetry.Metrics.SchedulerRequest.WithLabelValues(s.metaData.Key, "Idle", "OK").Inc()
+
 	return &pb.IdleReply{
 		Status:       pb.Status_Ok,
 		ErrorMessage: nil,
