@@ -20,8 +20,9 @@ import (
 )
 
 type Stats struct {
-	TotalInstance     int
-	TotalIdleInstance int
+	TotalInstance      int
+	TotalIdleInstance  int
+	TotalAssignWaiting uint
 }
 
 type Scaler interface {

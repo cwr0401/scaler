@@ -30,8 +30,10 @@ type scheduler struct {
 	idleUnit *list.List
 	idleChan chan struct{}
 
-	maxIdleUnit int
-	minIdleUnit int
+	maxIdleUnit      int
+	reservedIdleUnit int
+
+	waitUnitCounter uint
 }
 
 func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
@@ -50,23 +52,35 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 		units:    make(map[string]*Unit),
 		idleUnit: list.New(),
 
-		idleChan:    make(chan struct{}, 5),
-		maxIdleUnit: 5,
-		minIdleUnit: 1,
+		idleChan:         make(chan struct{}, 5),
+		maxIdleUnit:      5,
+		reservedIdleUnit: 3,
 	}
 
 	log.WithField("app", metaData.Key).Info("New scaler is created")
 	telemetry.Metrics.SchedulerUnitSlotResources.WithLabelValues(metaData.Key).Set(float64(metaData.GetMemoryInMb()))
 	scheduler.wg.Add(1)
 
-	// go func() {
-	// 	defer scheduler.wg.Done()
-	// 	scheduler.gcLoop()
-	// 	log.WithField("app", metaData.Key).Warnf("Scheduler GC goroutinue is stopped")
-	// 	// log.Infof("gc loop 2 for app: %s is stoped", metaData.Key)
-	// }()
+	go func() {
+		defer scheduler.wg.Done()
+		scheduler.gcLoop()
+		log.WithField("app", metaData.Key).Warnf("Scheduler GC goroutinue is stopped")
+	}()
 
 	return scheduler
+}
+
+func (s *scheduler) AssignWaiting() {
+	s.rw.Lock()
+	defer s.rw.Unlock()
+	s.waitUnitCounter++
+
+}
+
+func (s *scheduler) Assigndone() {
+	s.rw.Lock()
+	defer s.rw.Unlock()
+	s.waitUnitCounter--
 }
 
 func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
@@ -76,12 +90,18 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		"request_id": request.RequestId,
 	}).Infof("Scheduler Assign started")
 
-	maxWaitTime, err := time.ParseDuration(fmt.Sprintf("%ds", request.MetaData.TimeoutInSecs))
-	if err != nil {
-		maxWaitTime = 1 * time.Second
-	}
+	log.Infof("request metadaat timeoutinsecs %d", request.MetaData.TimeoutInSecs)
 
+	// maxWaitTime, err := time.ParseDuration(fmt.Sprintf("%ds", request.MetaData.TimeoutInSecs))
+
+	maxWaitTime := 1 * time.Second
+
+	// if err != nil {
+	// 	maxWaitTime = 1 * time.Second
+	// }
+	//s.AssignWaiting()
 	unit, err := s.GetUnit(ctx, request.RequestId, maxWaitTime)
+	//s.Assigndone()
 
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -130,9 +150,9 @@ func (s *scheduler) ReuseUnit(requestId string) *Unit {
 			s.metaData.Key,
 		).Inc()
 
-		s.rw.Unlock()
 		return unit
 	}
+	s.rw.Unlock()
 
 	return nil
 }
@@ -207,6 +227,7 @@ func (s *scheduler) CreateUnit(ctx context.Context, requestId string) (*Unit, er
 }
 
 func (s *scheduler) GetUnit(ctx context.Context, requestId string, waitTime time.Duration) (*Unit, error) {
+
 	// 复用
 	unit := s.ReuseUnit(requestId)
 	if unit != nil {
@@ -215,26 +236,43 @@ func (s *scheduler) GetUnit(ctx context.Context, requestId string, waitTime time
 
 	status := s.Stats()
 
-	if status.TotalInstance > 0 {
+	// 当前实例数量大于保留是
+	if status.TotalInstance >= s.reservedIdleUnit {
+		log.Info("test test test")
 		// 等待空闲
+		startWaiting := time.Now()
+		log.Infof("waitTime: %s", waitTime)
 		select {
 		case <-s.idleChan:
 			unit := s.ReuseUnit(requestId)
 			if unit != nil {
+				log.WithFields(log.Fields{
+					"app":         s.metaData.Key,
+					"request_id":  requestId,
+					"instance_id": unit.InstanceId,
+				}).Infof("Scheduler Assign successfully waited for an idle instance, cost %s", time.Since(startWaiting))
 				return unit, nil
 			}
+			log.WithFields(log.Fields{
+				"app":        s.metaData.Key,
+				"request_id": requestId,
+			}).Infof("Scheduler Assign failed wait for an idle instance, cost %s", time.Since(startWaiting))
+
 		case <-time.After(waitTime):
 			log.WithFields(log.Fields{
 				"app":        s.metaData.Key,
 				"request_id": requestId,
-			}).Infof("Wait for the idle instance for more than %s, Create new instance", waitTime)
+			}).Infof("Scheduler Assign waiting an idle instance for more than %s, Create new instance", waitTime)
 		}
+
+		log.Info("test1 test1 test1")
 	}
 
 	return s.CreateUnit(ctx, requestId)
 }
 
 func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
+
 	start := time.Now()
 	if request.Assigment == nil {
 		telemetry.Metrics.SchedulerIdle.WithLabelValues(s.metaData.Key, "InvalidArgument").Inc()
@@ -370,7 +408,7 @@ func (s *scheduler) gcLoop() {
 	for range ticker.C {
 		stats := s.Stats()
 
-		if stats.TotalInstance <= s.minIdleUnit {
+		if stats.TotalInstance <= int(stats.TotalAssignWaiting) {
 			s.rw.Lock()
 			for e := s.idleUnit.Front(); e != nil; e = e.Next() {
 				unit := e.Value.(*Unit)
@@ -430,7 +468,8 @@ func (s *scheduler) Stats() Stats {
 	s.rw.RLock()
 	defer s.rw.RUnlock()
 	return Stats{
-		TotalInstance:     len(s.units),
-		TotalIdleInstance: s.idleUnit.Len(),
+		TotalInstance:      len(s.units),
+		TotalIdleInstance:  s.idleUnit.Len(),
+		TotalAssignWaiting: s.waitUnitCounter,
 	}
 }
