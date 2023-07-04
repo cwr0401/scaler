@@ -6,118 +6,190 @@ import (
 	"time"
 
 	"github.com/AliyunContainerService/scaler/pkg/model"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type UnitStatus uint8
 
 const (
-	UnitInit UnitStatus = iota
-	UnitExecution
+	UnitInitDone UnitStatus = iota
+	UnitExecuting
 	UnitIdle
 	UnitNeedDestroy
-	UnitDestroy
+	UnitDestroyed
 )
 
 type Unit struct {
-	Instance *model.Instance
+	// 实例
+	InstanceId string
+	SlotId     string
+	MetaKey    string
 
-	// NeedDestroy     bool
-	DestroyReason   string
-	CostFluctuation float64
-	Status          UnitStatus
+	// 实例状态
+	status        UnitStatus
+	destroyReason string
+
+	// 成本
+	timeCost       uint64
+	timeCostFactor float64
+
+	// 时间
+	createSlotTime     time.Time
+	lastExecutionTime  time.Time
+	lastIdleTime       time.Time
+	executionDurations []time.Duration
+	destroyTime        time.Time
+
+	instance *model.Instance
 }
 
 func NewUnit(i *model.Instance, f float64) *Unit {
 	return &Unit{
-		Instance:        i,
-		CostFluctuation: f,
-		Status:          UnitInit,
+		InstanceId: i.Id,
+		SlotId:     i.Slot.Id,
+		MetaKey:    i.Meta.Key,
+		status:     UnitInitDone,
+		// memoryInMegabytes:  i.Slot.ResourceConfig.MemoryInMegabytes,
+		timeCost:           i.Slot.CreateDurationInMs + uint64(i.InitDurationInMs),
+		timeCostFactor:     f,
+		createSlotTime:     time.UnixMilli(int64(i.Slot.CreateTime)),
+		executionDurations: []time.Duration{},
+
+		instance: i,
 	}
 
 }
 
-func (i *Unit) Id() string {
-	return i.Instance.Id
+func (u *Unit) Status() UnitStatus {
+	if u.status == UnitDestroyed {
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("Instance has been destroyed, cannot invoke it anymore(destory reason: %v)", u.destroyReason)
+	}
+	return u.status
 }
 
-func (i *Unit) SlotId() string {
-	return i.Instance.Slot.Id
-}
-
-func (i *Unit) MetaKey() string {
-	return i.Instance.Meta.Key
-}
-
-func (i *Unit) SetNeedDestroy() {
-	if i.Status == UnitIdle {
-		maxIdleTimeInMs := int64((1.0 + i.CostFluctuation) * float64(i.ColdStartCost()))
-		idleDuration := time.Since(i.Instance.LastIdleTime)
-		if idleDuration.Milliseconds() > maxIdleTimeInMs {
-			i.DestroyReason = fmt.Sprintf("Idle duration: %s, max idle duration: %dms", idleDuration, maxIdleTimeInMs)
-			i.Status = UnitNeedDestroy
-		}
+func (u *Unit) DestroyReason() string {
+	switch u.status {
+	case UnitDestroyed, UnitNeedDestroy:
+		return u.destroyReason
+	default:
+		return ""
 	}
 }
 
-func (i *Unit) SetBusy() error {
-	switch i.Status {
-	case UnitInit, UnitIdle, UnitNeedDestroy:
-		i.Status = UnitExecution
-		i.Instance.Busy = true
-	case UnitDestroy:
-		return errors.New("Unit: instance has been destoryed")
-	case UnitExecution:
-		return errors.New("Unit: instance executing request")
-	}
-	return nil
+func (u *Unit) TimeCost() uint64 {
+	return u.timeCost
 }
 
-func (i *Unit) SetIdle() error {
-	switch i.Status {
-	case UnitInit, UnitExecution, UnitNeedDestroy:
-		i.Status = UnitIdle
-		i.Instance.Busy = false
-		i.Instance.LastIdleTime = time.Now()
-	case UnitDestroy:
-		return errors.New("Unit: instance has been destoryed")
+func (u *Unit) TimeCostFluctuation() float64 {
+	return u.timeCostFactor * float64(u.timeCost)
+}
+
+func (u *Unit) SetUnixExecutingStatus() error {
+	switch u.status {
+	case UnitInitDone:
+		u.status = UnitExecuting
+		u.instance.Busy = true
+		u.lastExecutionTime = time.Now()
+	case UnitExecuting:
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("SetUnixExecutingStatus error, unit is already executing")
+		return errors.New("unit is already executing")
 	case UnitIdle:
-		return errors.New("Unit: instance already freed")
+		u.status = UnitExecuting
+		u.instance.Busy = true
+		u.lastExecutionTime = time.Now()
+	case UnitNeedDestroy:
+		u.status = UnitExecuting
+		u.instance.Busy = true
+		u.lastExecutionTime = time.Now()
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Infof("Reuse an need destroy unit")
+	case UnitDestroyed:
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("SetUnixExecutingStatus error, unit has been destroyed")
+		return fmt.Errorf("unit is already destroyed as %s", u.destroyTime)
+	default:
+		return errors.New("invalid status")
 	}
 	return nil
 }
 
-func (i *Unit) ColdStartCost() uint64 {
-	return i.Instance.Slot.CreateDurationInMs + uint64(i.Instance.InitDurationInMs)
+func (u *Unit) SetUnixIdleStatus() error {
+	switch u.status {
+	case UnitInitDone:
+		u.status = UnitIdle
+		u.instance.Busy = false
+		u.lastIdleTime = time.Now()
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("SetUnixIdleStatus error, unit not executing")
+	case UnitExecuting:
+		u.status = UnitIdle
+		u.instance.Busy = false
+		u.lastIdleTime = time.Now()
+		u.executionDurations = append(u.executionDurations, u.lastIdleTime.Sub(u.lastExecutionTime))
+	case UnitIdle:
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("SetUnixIdleStatus error, unit has already idle")
+	case UnitNeedDestroy:
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("SetUnixIdleStatus error, unit need destroy")
+	case UnitDestroyed:
+		log.WithFields(log.Fields{
+			"app":         u.MetaKey,
+			"instance_id": u.InstanceId,
+			"slot_id":     u.SlotId,
+		}).Errorf("SetUnixIdleStatus error, unit has been destroyed")
+		return fmt.Errorf("unit is already destroyed as %s", u.destroyTime)
+	default:
+		return errors.New("invalid status")
+	}
+	return nil
 }
 
-// func (i *Unit) gcLoop() {
-// 	log.Infof("gc loop for Meta %s Unit %s is started", i.MetaKey(), i.Id())
-// 	// 豪秒级别
-// 	ticker := time.NewTicker(1 * time.Millisecond)
-// 	maxIdleTime := int64((1.0 + i.CostFluctuation) * float64(i.ColdStartCost()))
-// 	for range ticker.C {
-// 		if i.Instance.Busy {
-// 			continue
-// 		}
-// 		switch i.Status {
-// 		case UnitInit:
-// 		case UnitExecution:
-// 		case UnitNeedDestroy:
-// 			continue
-// 		case UnitDestroy:
-// 			log.Infof(" %s Unit %s is stopped", i.MetaKey(), i.Id())
-// 			return
-// 		case UnitIdle:
-// 			i.setNeedDestroy(maxIdleTime)
-// 			if i.Status == UnitNeedDestroy {
-// 				log.Infof("App %s Unit %s need destroy because %s.", i.MetaKey(), i.Id(), i.DestroyReason)
-// 				select {
-// 				case i.GCQueue <- struct{}{}:
-// 					log.Infof("App %s Unit %s send a gc signal.", i.MetaKey(), i.Id())
-// 				default:
-// 				}
+func (u *Unit) SetNeedDestroyStatus() error {
+	switch u.status {
+	case UnitInitDone:
+		// log.WithFields(log.Fields{
+		// 	"app":         u.MetaKey,
+		// 	"instance_id": u.InstanceId,
+		// 	"slot_id":     u.SlotId,
+		// }).Errorf("")
 
-// 			}
-// 		}
-// 	}
-// }
+	case UnitExecuting:
+		return fmt.Errorf("SetNeedDestroyStatus error, unit is in execution state")
+	case UnitIdle:
+		idleDuration := time.Since(u.lastIdleTime)
+		if idleDuration.Milliseconds() > int64(u.TimeCostFluctuation()) {
+			u.status = UnitNeedDestroy
+			u.destroyReason = fmt.Sprintf("Idle duration: %s, max cost duration: %dms", idleDuration, int64(u.TimeCostFluctuation()))
+		}
+	case UnitNeedDestroy:
+	case UnitDestroyed:
+	default:
+		return errors.New("invalid status")
+	}
+	return nil
+}

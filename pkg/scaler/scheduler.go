@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/AliyunContainerService/scaler/pkg/config"
 	"github.com/AliyunContainerService/scaler/pkg/model"
 	"github.com/AliyunContainerService/scaler/pkg/platform_client"
@@ -17,44 +15,23 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type scheduler struct {
 	config         *config.Config
 	metaData       *model.Meta
 	platformClient platform_client.Client
-	mu             sync.Mutex
+	rw             sync.RWMutex
 	wg             sync.WaitGroup
-	units          map[string]*Unit
-	idleUnit       *list.List
 
-	// Assign 频率
-	assignStats requestStatistics
+	units    map[string]*Unit
+	idleUnit *list.List
+	idleChan chan struct{}
 
-	// Idle 频率
-	idleStats requestStatistics
-}
-
-type requestStatistics struct {
-	Count            uint64
-	IntervalDuration []time.Duration
-	lastTime         time.Time
-}
-
-func NewRequestStatistics() requestStatistics {
-	return requestStatistics{
-		Count:            0,
-		IntervalDuration: make([]time.Duration, 0, 1024),
-		lastTime:         time.Now(),
-	}
-}
-
-func (r *requestStatistics) Inc(now time.Time) {
-	if r.Count != 0 {
-		r.IntervalDuration = append(r.IntervalDuration, now.Sub(r.lastTime))
-	}
-	r.Count += 1
-	r.lastTime = now
+	maxIdleUnit int
+	minIdleUnit int
 }
 
 func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
@@ -62,116 +39,149 @@ func NewScheduler(metaData *model.Meta, config *config.Config) Scaler {
 	if err != nil {
 		log.WithField("app", metaData.Key).Fatalf("client init with error: %s", err.Error())
 	}
+
 	scheduler := &scheduler{
 		config:         config,
 		metaData:       metaData,
 		platformClient: client,
-		mu:             sync.Mutex{},
+		rw:             sync.RWMutex{},
 		wg:             sync.WaitGroup{},
-		units:          make(map[string]*Unit),
-		idleUnit:       list.New(),
-		assignStats:    NewRequestStatistics(),
-		idleStats:      NewRequestStatistics(),
+
+		units:    make(map[string]*Unit),
+		idleUnit: list.New(),
+
+		idleChan:    make(chan struct{}, 5),
+		maxIdleUnit: 5,
+		minIdleUnit: 1,
 	}
+
 	log.WithField("app", metaData.Key).Info("New scaler is created")
 	telemetry.Metrics.SchedulerUnitSlotResources.WithLabelValues(metaData.Key).Set(float64(metaData.GetMemoryInMb()))
-	// log.Infof("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
 
-	go func() {
-		defer scheduler.wg.Done()
-		scheduler.gcLoop()
-		log.WithField("app", metaData.Key).Warnf("Scheduler GC goroutinue is stopped")
-		// log.Infof("gc loop 2 for app: %s is stoped", metaData.Key)
-	}()
+	// go func() {
+	// 	defer scheduler.wg.Done()
+	// 	scheduler.gcLoop()
+	// 	log.WithField("app", metaData.Key).Warnf("Scheduler GC goroutinue is stopped")
+	// 	// log.Infof("gc loop 2 for app: %s is stoped", metaData.Key)
+	// }()
 
 	return scheduler
 }
 
 func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
 	start := time.Now()
-	instanceId := uuid.New().String()
-
-	defer func() {
-		log.WithFields(log.Fields{
-			"app":         s.metaData.Key,
-			"request_id":  request.RequestId,
-			"instance_id": instanceId,
-		}).Infof("Assign cost %dms", time.Since(start).Milliseconds())
-	}()
 	log.WithFields(log.Fields{
 		"app":        s.metaData.Key,
 		"request_id": request.RequestId,
 	}).Infof("Scheduler Assign started")
 
-	s.mu.Lock()
-	s.assignStats.Inc(start)
+	maxWaitTime, err := time.ParseDuration(fmt.Sprintf("%ds", request.MetaData.TimeoutInSecs))
+	if err != nil {
+		maxWaitTime = 1 * time.Second
+	}
+
+	unit, err := s.GetUnit(ctx, request.RequestId, maxWaitTime)
+
+	if err != nil {
+		log.WithFields(log.Fields{
+			"app":        s.metaData.Key,
+			"request_id": request.RequestId,
+		}).Infof("Assign instance error: %s", err.Error())
+		return nil, err
+	}
+
+	log.WithFields(log.Fields{
+		"app":         s.metaData.Key,
+		"request_id":  request.RequestId,
+		"instance_id": unit.InstanceId,
+	}).Infof("Assign cost %dms", time.Since(start).Milliseconds())
+
+	return &pb.AssignReply{
+		Status: pb.Status_Ok,
+		Assigment: &pb.Assignment{
+			RequestId:  request.RequestId,
+			MetaKey:    unit.MetaKey,
+			InstanceId: unit.InstanceId,
+		},
+		ErrorMessage: nil,
+	}, nil
+
+}
+
+func (s *scheduler) ReuseUnit(requestId string) *Unit {
+	s.rw.Lock()
 	if element := s.idleUnit.Front(); element != nil {
 		unit := element.Value.(*Unit)
-		unit.SetBusy()
 		s.idleUnit.Remove(element)
-		s.mu.Unlock()
-		instanceId = unit.Instance.Id
-		// log.Infof("Assign, request id: %s, instance %s reused", request.RequestId, instanceId)
+		err := unit.SetUnixExecutingStatus()
+		s.rw.Unlock()
+
+		if err != nil {
+			return nil
+		}
 		log.WithFields(log.Fields{
 			"app":         s.metaData.Key,
-			"request_id":  request.RequestId,
-			"instance_id": instanceId,
+			"request_id":  requestId,
+			"instance_id": unit.InstanceId,
 		}).Infof("Scheduler Assign reuse instance")
+
 		telemetry.Metrics.SchedulerAssignReuse.WithLabelValues(
 			s.metaData.Key,
 		).Inc()
-		return &pb.AssignReply{
-			Status: pb.Status_Ok,
-			Assigment: &pb.Assignment{
-				RequestId:  request.RequestId,
-				MetaKey:    unit.Instance.Meta.Key,
-				InstanceId: unit.Instance.Id,
-			},
-			ErrorMessage: nil,
-		}, nil
-	}
-	s.mu.Unlock()
 
+		s.rw.Unlock()
+		return unit
+	}
+
+	return nil
+}
+
+func (s *scheduler) CreateUnit(ctx context.Context, requestId string) (*Unit, error) {
+	// 等待超时，直接创建
 	//Create new Instance
+	instanceId := uuid.New().String()
+
 	resourceConfig := model.SlotResourceConfig{
 		ResourceConfig: pb.ResourceConfig{
-			MemoryInMegabytes: request.MetaData.MemoryInMb,
+			MemoryInMegabytes: s.metaData.MemoryInMb,
 		},
 	}
 	log.WithFields(log.Fields{
 		"app":         s.metaData.Key,
-		"request_id":  request.RequestId,
+		"request_id":  requestId,
 		"instance_id": instanceId,
 	}).Infof("Scheduler Assign invokes CreateSlot")
-	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
+	start := time.Now()
+	slot, err := s.platformClient.CreateSlot(ctx, requestId, &resourceConfig)
+
 	if err != nil {
 		telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "CreateSlotFailed").Observe(
 			float64(time.Since(start).Milliseconds()),
 		)
 		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
-		// log.Infof(errorMessage)
 		log.WithFields(log.Fields{
 			"app":         s.metaData.Key,
-			"request_id":  request.RequestId,
+			"request_id":  requestId,
 			"instance_id": instanceId,
 		}).Errorf("Scheduler Assign %s", errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
-
 	meta := &model.Meta{
 		Meta: pb.Meta{
-			Key:           request.MetaData.Key,
-			Runtime:       request.MetaData.Runtime,
-			TimeoutInSecs: request.MetaData.TimeoutInSecs,
+			Key:           s.metaData.Key,
+			Runtime:       s.metaData.Runtime,
+			TimeoutInSecs: s.metaData.TimeoutInSecs,
 		},
 	}
 	log.WithFields(log.Fields{
 		"app":         s.metaData.Key,
-		"request_id":  request.RequestId,
+		"request_id":  requestId,
 		"instance_id": instanceId,
 	}).Infof("Scheduler Assign invokes Init")
-	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
+
+	instance, err := s.platformClient.Init(ctx, requestId, instanceId, slot, meta)
+
 	if err != nil {
 		telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "InitFailed").Observe(
 			float64(time.Since(start).Milliseconds()),
@@ -180,44 +190,55 @@ func (s *scheduler) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.
 		// log.Infof(errorMessage)
 		log.WithFields(log.Fields{
 			"app":         s.metaData.Key,
-			"request_id":  request.RequestId,
+			"request_id":  requestId,
 			"instance_id": instanceId,
 		}).Errorf("Scheduler Assign %s", errorMessage)
 		return nil, status.Errorf(codes.Internal, errorMessage)
 	}
 
-	//add new instance
-	s.mu.Lock()
 	unit := NewUnit(instance, s.config.CostFluctuation)
-	unit.SetBusy()
-	s.units[instance.Id] = unit
 
-	s.mu.Unlock()
-	// log.Infof("request id: %s, instance %s for app %s is created, init latency: %dms", request.RequestId, instance.Id, instance.Meta.Key, instance.InitDurationInMs)
-	log.WithFields(log.Fields{
-		"request_id":  request.RequestId,
-		"instance_id": instance.Id,
-		"app":         instance.Meta.Key,
-	}).Infof("Scheduler Assign create instance init latency: %dms", instance.InitDurationInMs)
-	telemetry.Metrics.SchedulerAssignCreateDurations.WithLabelValues(s.metaData.Key, "CreateSuccess").Observe(
-		float64(time.Since(start).Milliseconds()),
-	)
-	return &pb.AssignReply{
-		Status: pb.Status_Ok,
-		Assigment: &pb.Assignment{
-			RequestId:  request.RequestId,
-			MetaKey:    instance.Meta.Key,
-			InstanceId: instance.Id,
-		},
-		ErrorMessage: nil,
-	}, nil
+	s.rw.Lock()
+	unit.SetUnixExecutingStatus()
+	s.units[instance.Id] = unit
+	s.rw.Unlock()
+
+	return unit, nil
+}
+
+func (s *scheduler) GetUnit(ctx context.Context, requestId string, waitTime time.Duration) (*Unit, error) {
+	// 复用
+	unit := s.ReuseUnit(requestId)
+	if unit != nil {
+		return unit, nil
+	}
+
+	status := s.Stats()
+
+	if status.TotalInstance > 0 {
+		// 等待空闲
+		select {
+		case <-s.idleChan:
+			unit := s.ReuseUnit(requestId)
+			if unit != nil {
+				return unit, nil
+			}
+		case <-time.After(waitTime):
+			log.WithFields(log.Fields{
+				"app":        s.metaData.Key,
+				"request_id": requestId,
+			}).Infof("Wait for the idle instance for more than %s, Create new instance", waitTime)
+		}
+	}
+
+	return s.CreateUnit(ctx, requestId)
 }
 
 func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
 	start := time.Now()
 	if request.Assigment == nil {
 		telemetry.Metrics.SchedulerIdle.WithLabelValues(s.metaData.Key, "InvalidArgument").Inc()
-		errorMessage := fmt.Sprintf("assignment is nil")
+		errorMessage := "assignment is nil"
 		log.WithFields(log.Fields{
 			"app": s.metaData.Key,
 		}).Errorf("Scheduler Idle %s", errorMessage)
@@ -230,7 +251,7 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 
 	instanceId := request.Assigment.InstanceId
 	needDestroy := false
-	var instanceCreateTime int64 = 0
+	var instanceCreateSlotTime time.Time
 
 	action := ""
 
@@ -244,7 +265,6 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 		}).Infof("Scheduler Idle, cost %dus", durationInMs)
 		telemetry.Metrics.SchedulerIdle.WithLabelValues(s.metaData.Key, action).Inc()
 	}()
-	//log.Infof("Idle, request id: %s", request.Assigment.RequestId)
 
 	slotId := ""
 	if request.Result != nil && request.Result.NeedDestroy != nil && *request.Result.NeedDestroy {
@@ -252,19 +272,20 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 	}
 	defer func() {
 		if needDestroy {
-			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance", instanceCreateTime)
+			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance", instanceCreateSlotTime)
 		}
 	}()
 	log.WithFields(log.Fields{
 		"app":        s.metaData.Key,
 		"request_id": request.Assigment.RequestId,
 	}).Infof("Scheduler Idle started")
-	s.mu.Lock()
-	s.idleStats.Inc(start)
-	defer s.mu.Unlock()
+
+	s.rw.Lock()
+	defer s.rw.Unlock()
+
 	if unit := s.units[instanceId]; unit != nil {
-		slotId = unit.Instance.Slot.Id
-		instanceCreateTime = int64(unit.Instance.Slot.CreateTime)
+		slotId = unit.SlotId
+		instanceCreateSlotTime = unit.createSlotTime
 		if needDestroy {
 			action = "Destroy"
 			log.WithFields(log.Fields{
@@ -273,11 +294,11 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 				"instance_id": instanceId,
 			}).Infof("Scheduler Idle instance need be destroy")
 			delete(s.units, instanceId)
-			unit.Status = UnitDestroy
+			unit.status = UnitDestroyed
 			return reply, nil
 		}
 
-		if !unit.Instance.Busy {
+		if unit.status != UnitExecuting {
 			log.WithFields(log.Fields{
 				"app":         s.metaData.Key,
 				"request_id":  request.Assigment.RequestId,
@@ -287,8 +308,26 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 			return reply, nil
 		}
 		action = "Release"
-		unit.SetIdle()
-		s.idleUnit.PushFront(unit)
+		err := unit.SetUnixIdleStatus()
+		if err != nil {
+			return reply, nil
+		}
+
+		select {
+		case s.idleChan <- struct{}{}:
+			s.idleUnit.PushFront(unit)
+		default:
+			needDestroy = true
+			action = "Destroy"
+			delete(s.units, instanceId)
+			unit.status = UnitDestroyed
+			log.WithFields(log.Fields{
+				"app":         s.metaData.Key,
+				"request_id":  request.Assigment.RequestId,
+				"instance_id": instanceId,
+			}).Infof("Idle Channel is full, destroy instance")
+		}
+
 	} else {
 		action = "NotFound"
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
@@ -298,14 +337,11 @@ func (s *scheduler) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.Idle
 		Status:       pb.Status_Ok,
 		ErrorMessage: nil,
 	}, nil
+
 }
 
-func (s *scheduler) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string, createTimeInMs int64) {
-	var aliveTime int64
-	if createTimeInMs != 0 {
-		now := time.Now().UnixMilli()
-		aliveTime = now - createTimeInMs
-	}
+func (s *scheduler) deleteSlot(ctx context.Context, requestId, slotId, instanceId, metaKey, reason string, createTime time.Time) {
+	aliveTime := time.Since(createTime).Milliseconds()
 
 	// log.Infof("start delete Instance %s (Slot: %s) of app: %s", instanceId, slotId, metaKey)
 	log.WithFields(log.Fields{
@@ -332,32 +368,67 @@ func (s *scheduler) gcLoop() {
 	log.Infof("gc loop for app: %s is started", s.metaData.Key)
 	ticker := time.NewTicker(1 * time.Millisecond)
 	for range ticker.C {
-		s.mu.Lock()
+		stats := s.Stats()
+
+		if stats.TotalInstance <= s.minIdleUnit {
+			s.rw.Lock()
+			for e := s.idleUnit.Front(); e != nil; e = e.Next() {
+				unit := e.Value.(*Unit)
+
+				idleDuration := time.Since(unit.lastIdleTime)
+				maxIdleTimeInMs := int64(unit.TimeCostFluctuation() * 50)
+				if idleDuration.Milliseconds() > maxIdleTimeInMs {
+					unit.status = UnitNeedDestroy
+					unit.destroyReason = fmt.Sprintf("Idle duration: %s, max idle duration: %dms", idleDuration, maxIdleTimeInMs)
+				}
+
+				if unit.status == UnitNeedDestroy {
+					// log.Infof("gc loop for app: %s, Instance %s start destroy.", s.metaData.Key, unit.Id())
+					s.idleUnit.Remove(e)
+					delete(s.units, unit.InstanceId)
+					go func() {
+						log.Infof("Instance %s Delete(%s)", unit.InstanceId, unit.DestroyReason())
+						ctx := context.Background()
+						ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+						defer cancel()
+						s.deleteSlot(ctx, uuid.NewString(), unit.SlotId, unit.InstanceId, unit.MetaKey, unit.DestroyReason(), unit.createSlotTime)
+					}()
+					unit.status = UnitDestroyed
+				}
+			}
+			s.rw.Unlock()
+			continue
+		}
+
+		s.rw.Lock()
 		// log.Infof("gc loop for app: %s is started, TotalInstance %d TotalIdleInstance %d", s.metaData.Key, len(s.units), s.idleUnit.Len())
 		for e := s.idleUnit.Front(); e != nil; e = e.Next() {
 			unit := e.Value.(*Unit)
-			unit.SetNeedDestroy()
-			if unit.Status == UnitNeedDestroy {
+			err := unit.SetNeedDestroyStatus()
+			if err != nil {
+				continue
+			}
+			if unit.status == UnitNeedDestroy {
 				// log.Infof("gc loop for app: %s, Instance %s start destroy.", s.metaData.Key, unit.Id())
 				s.idleUnit.Remove(e)
-				delete(s.units, unit.Instance.Id)
+				delete(s.units, unit.InstanceId)
 				go func() {
-					log.Infof("Instance %s Delete(%s)", unit.Id(), unit.DestroyReason)
+					log.Infof("Instance %s Delete(%s)", unit.InstanceId, unit.DestroyReason())
 					ctx := context.Background()
 					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 					defer cancel()
-					s.deleteSlot(ctx, uuid.NewString(), unit.SlotId(), unit.Id(), unit.MetaKey(), unit.DestroyReason, int64(unit.Instance.Slot.CreateTime))
+					s.deleteSlot(ctx, uuid.NewString(), unit.SlotId, unit.InstanceId, unit.MetaKey, unit.DestroyReason(), unit.createSlotTime)
 				}()
-				unit.Status = UnitDestroy
+				unit.status = UnitDestroyed
 			}
 		}
-		s.mu.Unlock()
+		s.rw.Unlock()
 	}
 }
 
 func (s *scheduler) Stats() Stats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.rw.RLock()
+	defer s.rw.RUnlock()
 	return Stats{
 		TotalInstance:     len(s.units),
 		TotalIdleInstance: s.idleUnit.Len(),
